@@ -99,13 +99,22 @@ generates a filter (BPF) that bwrap loads (`--seccomp`). It **denies** calls tha
 and that show up in many exploits:
 
 - `io_uring_*`: the biggest source of kernel bugs in recent years. Google turned it off on Android and ChromeOS.
-- `bpf`, `perf_event_open`, `userfaultfd`: large surfaces used in exploits.
+- `bpf`, `perf_event_open`: large surfaces used in exploits.
 - `keyctl`, `add_key`, `request_key`: the kernel keyring.
 - Mounting, modules, kexec, the clock, swap, `syslog`, `open_by_handle_at`...
 - `ioctl(TIOCSTI/TIOCLINUX)`: "typing" into the terminal that started the app.
 
 The list is Flatpak's, plus `io_uring`. Everything else stays allowed; a denied call returns `EPERM`, which programs
 treat as "not supported". `lockbox-seccomp --list` prints the list.
+
+**`userfaultfd` is deliberately allowed.** Emulators and recompilations use it to learn which guest memory the game
+wrote (a texture changed, code was patched). An early version denied it and TotK Recomp dropped to 8 FPS in its menu,
+re-decoding every texture on every frame, without any error message. The kernel already disables the exploitable part
+(handling faults raised inside the kernel) for unprivileged users when `vm.unprivileged_userfaultfd = 0`, which is
+the default.
+
+**If an app is slow or broken only inside the box,** run it once with `--no-seccomp`. If that fixes it, a call on the
+list is needed: please open an issue with the app's name.
 
 ## 5. User namespaces
 

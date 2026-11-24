@@ -27,7 +27,10 @@ int main(int argc, char **argv) {
         {"keyctl", SCMP_SYS(keyctl), 0}, {"add_key", SCMP_SYS(add_key), 0}, {"request_key", SCMP_SYS(request_key), 0},
         /* large kernel surfaces with a history of exploited bugs */
         {"bpf", SCMP_SYS(bpf), 0}, {"perf_event_open", SCMP_SYS(perf_event_open), 0},
-        {"userfaultfd", SCMP_SYS(userfaultfd), 0},
+        /* userfaultfd is NOT denied: emulators and recompilations use it to see which guest memory the game wrote
+           (a texture changed, code was patched). Without it, TotK Recomp re-decoded every ASTC texture on every
+           frame (8 FPS in the menu instead of 60). The dangerous part of it (catching faults raised inside the
+           kernel) is already off for unprivileged users when vm.unprivileged_userfaultfd = 0, the default. */
         {"io_uring_setup", SCMP_SYS(io_uring_setup), 0}, {"io_uring_enter", SCMP_SYS(io_uring_enter), 0},
         {"io_uring_register", SCMP_SYS(io_uring_register), 0},
         /* system administration: without capabilities these would fail anyway, here they fail earlier */

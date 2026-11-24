@@ -57,6 +57,23 @@ next time Steam started any game with it.
 `~/.local/bin`, `~/.config/autostart`, `~/.bashrc`... For Proton, use `umu-launcher` with a runtime inside the fake
 home, or a copy of Proton that belongs to the box (see `examples/proton-umu.sh`).
 
+### 6. Regression caught after the migration: `userfaultfd`
+
+The first lockbox filter also denied `userfaultfd`. TotK Recomp then ran at **8 FPS in its menu** (124 ms per frame,
+115 ms of it preparing the frame, the GPU busy for only 9 ms), with no error anywhere. Its log showed why: it decoded
+**12.5 billion** ASTC texels in 25 seconds instead of about 0.24 billion, because without `userfaultfd` it cannot tell
+which textures the game wrote and decodes all of them on every frame. Same game, 25 seconds each:
+
+| Box | ASTC texels decoded |
+|---|---|
+| previous box (no seccomp) | 240 M |
+| lockbox with the first filter | 12,523 M |
+| lockbox `--no-seccomp` | 243 M |
+| lockbox with `userfaultfd` allowed (current) | 246 M |
+
+`userfaultfd` is now allowed (see [HOW-IT-WORKS.md](HOW-IT-WORKS.md#4-seccomp-fewer-doors-into-the-kernel)).
+Lesson: a seccomp denial can show up as a silent slowdown, not as a crash.
+
 ### Fixed before this audit (earlier hardening)
 
 - `/dev/uinput` went into the box: an app could create a virtual keyboard and type outside.

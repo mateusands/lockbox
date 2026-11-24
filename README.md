@@ -124,7 +124,7 @@ you. Each piece, and why it exists, is explained in **[docs/HOW-IT-WORKS.md](doc
 1. **Namespaces (bwrap):** own network, processes, IPC and hostname; `/usr` and `/etc` read-only; a fake home; empty `/tmp` and `/run`; a clean environment.
 2. **Filtered devices:** the GPU yes; raw keyboard and mouse no; `hidraw` only for game controllers; `uinput` never.
 3. **Wayland with a security context** (`lockbox-wayland`, ~80 lines of C): the same protocol Flatpak uses (`wp_security_context_v1`).
-4. **seccomp** (`lockbox-seccomp`): denies 37 kernel calls (and 2 terminal ioctls) that normal apps do not use.
+4. **seccomp** (`lockbox-seccomp`): denies 36 kernel calls (and 2 terminal ioctls) that normal apps do not use.
 5. **User namespaces blocked** (bwrap's `--disable-userns`).
 
 ## What lockbox does NOT cover
