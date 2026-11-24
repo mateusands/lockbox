@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# lockbox — a lightweight sandbox for Linux apps and games (bubblewrap). No network and no access to your files by
+# default.
+#
+#   lockbox --home DIR [options] -- command [args...]
+#   lockbox --home DIR [options] --test          show what the app would see and probe the known leaks
+#
+# Folders
+#   --home DIR               becomes the app's home (mounted over your real home, at the same path)
+#   --rw PATH                the app can read and write it (saves, settings), at the same path
+#   --ro PATH                the app can only read it (program files, ROMs...)
+#   --rw-at SOURCE DEST      like --rw, mounted somewhere else
+#   --ro-at SOURCE DEST      like --ro, mounted somewhere else
+# Display
+#   (default)                Wayland with a security context: the app cannot read the clipboard without focus,
+#                            fake keyboard/mouse input, capture the screen or see other windows
+#   --wayland direct         Wayland without a security context (only if an app will not start with the default)
+#   --x11 private            for X11-only apps: a PRIVATE Xwayland that holds none of your other windows
+#   --x11 host               (avoid) your session's X11: the app can read keystrokes sent to other X11 windows
+# Other
+#   --net                    allow network access (default: no network at all, not even the local one)
+#   --no-audio               no PipeWire/PulseAudio (no sound and no microphone)
+#   --allow-userns           let the app create user namespaces: needed by Proton through umu/pressure-vessel and
+#                            by the Chromium/Electron internal sandbox
+#   --no-seccomp             turn off the system call filter (for debugging only)
+#   --memory SIZE            cap the app's memory (e.g. 8G), through systemd-run --user
+#   --udmabuf                pass /dev/udmabuf (faster GPU memory import in some emulators on RADV)
+#   --name NAME              app name for the compositor (default: derived from the --home folder)
+# Environment: LOCKBOX_ENV_NAME=value becomes NAME=value inside the box. MANGOHUD is passed as is.
+set -euo pipefail
+
+self=$(readlink -f "$0"); here=$(dirname "$self")
+find_file() {  # find_file NAME: look in the install locations and in the source tree
+    local d
+    for d in "${LOCKBOX_LIB:-}" "$here/../lib/lockbox" "$here/../build" "$here/../lib"; do
+        [[ -n $d && -e $d/$1 ]] && { echo "$d/$1"; return 0; }
+    done
+    return 1
+}
+die() { echo "lockbox: $*" >&2; exit 2; }
+warn() { echo "lockbox: $*" >&2; }
+
+fake_home= name= test_mode=0 x11_mode=none wl_mode=secure net=0 audio=1 userns=0 seccomp=1 memory=
+binds=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --home) fake_home=$2; shift 2 ;;
+        --name) name=$2; shift 2 ;;
+        --rw|--ro)
+                [[ -e $2 ]] || die "does not exist: $2"
+                [[ $1 == --rw ]] && binds+=(--bind "$2" "$2") || binds+=(--ro-bind "$2" "$2"); shift 2 ;;
+        --rw-at|--ro-at)
+                [[ -e $2 ]] || die "does not exist: $2"
+                [[ $1 == --rw-at ]] && binds+=(--bind "$2" "$3") || binds+=(--ro-bind "$2" "$3"); shift 3 ;;
+        --test) test_mode=1; shift ;;
+        --x11)  [[ ${2:-} == private || ${2:-} == host ]] || die "--x11 private|host"; x11_mode=$2; shift 2 ;;
+        --wayland) [[ ${2:-} == direct || ${2:-} == secure ]] || die "--wayland secure|direct"; wl_mode=$2; shift 2 ;;
+        --net) net=1; shift ;;
+        --no-audio) audio=0; shift ;;
+        --allow-userns) userns=1; shift ;;
+        --no-seccomp) seccomp=0; shift ;;
+        --memory) memory=$2; shift 2 ;;
+        --udmabuf) [[ -e /dev/udmabuf ]] && binds+=(--dev-bind /dev/udmabuf /dev/udmabuf); shift ;;
+        --)     shift; break ;;
+        *)      die "unknown option: $1 (see the top of $self)" ;;
+    esac
+done
+[[ -n $fake_home ]] || die "missing --home DIR"
+mkdir -p "$fake_home"
+fake_home=$(readlink -f "$fake_home")
+[[ $fake_home != "$HOME" ]] || die "--home cannot be your real home"
+[[ -n $name ]] || name=$(basename "$(dirname "$fake_home")")-$(basename "$fake_home")
+name=${name//[^A-Za-z0-9._-]/_}
+command -v bwrap >/dev/null || die "install bubblewrap (pacman -S bubblewrap)"
+run_dir=/run/user/$(id -u)
+
+# Per-run state (Wayland socket, seccomp filter) lives in /run/user/UID/lockbox.PID.XXXXXX. bwrap replaces this
+# process (same PID), so the folder belongs to a live box while that PID exists; folders of boxes that already
+# exited are removed here, on the next run (and /run/user is wiped at logout anyway).
+for old in "$run_dir"/lockbox.*.*; do
+    [[ -d $old ]] || continue
+    pid=${old#"$run_dir"/lockbox.}; pid=${pid%%.*}
+    [[ $pid =~ ^[0-9]+$ ]] && ! kill -0 "$pid" 2>/dev/null && rm -rf "$old"
+done
+state=$(mktemp -d "$run_dir/lockbox.$$.XXXXXX")
+chmod 700 "$state"
+
+args=(
+    --die-with-parent --new-session
+    --unshare-pid --unshare-uts --unshare-ipc --unshare-cgroup-try
+    # the system, read-only
+    --ro-bind /usr /usr
+    --symlink usr/bin /bin --symlink usr/bin /sbin
+    --symlink usr/lib /lib --symlink usr/lib /lib64
+    --ro-bind /etc /etc
+    --ro-bind-try /opt /opt
+    --ro-bind /sys /sys
+    --proc /proc
+    --dev /dev --tmpfs /dev/shm
+    --dev-bind-try /dev/dri /dev/dri
+    --dev-bind-try /dev/input /dev/input
+    --tmpfs /tmp --tmpfs /var/tmp
+    --tmpfs /run
+    --ro-bind-try /run/udev /run/udev
+    --perms 0700 --dir "$run_dir"
+    # the fake home over the real one (absolute paths saved in settings keep working)
+    --bind "$fake_home" "$HOME"
+    # clean environment: no tokens or variables from your session
+    --clearenv
+    --setenv HOME "$HOME" --setenv USER "$USER" --setenv LOGNAME "$USER"
+    --setenv PATH /usr/local/bin:/usr/bin
+    --setenv LANG "${LANG:-C.UTF-8}"
+    --setenv XDG_RUNTIME_DIR "$run_dir"
+)
+[[ $net == 1 ]] || args+=(--unshare-net)
+# user namespaces: blocked by default (they are the entry point of many kernel exploits)
+[[ $userns == 1 ]] || args+=(--unshare-user --disable-userns)
+
+# a machine ID of this box's own (the real one identifies your PC forever)
+mkdir -p "$fake_home/.lockbox"
+[[ -s $fake_home/.lockbox/machine-id ]] || od -An -N16 -tx1 /dev/urandom | tr -d ' \n' > "$fake_home/.lockbox/machine-id"
+args+=(--ro-bind "$fake_home/.lockbox/machine-id" /etc/machine-id)
+
+# Game controllers. hidraw gives the raw reports of ANY device, keyboards included, so a hidraw node only gets in
+# when it belongs to a controller maker (Sony, Nintendo, Valve, Microsoft, 8BitDo) AND is a joystick (has a jsN).
+# /dev/input goes in whole: keyboard and mouse nodes are root:input and the app cannot open them.
+# /dev/uinput NEVER goes in (with it an app could create a virtual keyboard and type outside the box).
+controller_vendors='054C|057E|28DE|045E|2DC8'
+is_controller() {
+    local s=/sys/class/hidraw/$1/device hid_id
+    hid_id=$(grep -m1 '^HID_ID=' "$s/uevent" 2>/dev/null) || return 1
+    [[ ${hid_id#*:} =~ ^0000($controller_vendors): ]] || return 1
+    compgen -G "$s/input/input*/js*" >/dev/null
+}
+for dev in /dev/hidraw*; do
+    [[ -e $dev ]] || continue
+    is_controller "${dev##*/}" && args+=(--dev-bind "$dev" "$dev")
+done
+
+# display
+wl_fd=
+if [[ -n ${WAYLAND_DISPLAY:-} && -S "$run_dir/$WAYLAND_DISPLAY" ]]; then
+    sock="$run_dir/$WAYLAND_DISPLAY"
+    if [[ $wl_mode == secure ]]; then
+        if helper=$(find_file lockbox-wayland); then
+            # the helper lives while fd $wl_fd is open; bwrap inherits that fd, so it closes by itself when the app
+            # (and everything it started) exits
+            exec {wl_fd}> >(exec "$helper" "$state/wayland-0" "lockbox.$name" > "$state/wayland.out" 2> "$state/wayland.err")
+            for _ in $(seq 50); do grep -qs ready "$state/wayland.out" && break; sleep 0.05; done
+            if grep -qs ready "$state/wayland.out"; then
+                sock="$state/wayland-0"
+            else
+                warn "Wayland without a security context ($(cat "$state/wayland.err" 2>/dev/null)); use --wayland direct to silence this"
+            fi
+        else
+            warn "lockbox-wayland not found (run make): Wayland without a security context"
+        fi
+    fi
+    args+=(--ro-bind "$sock" "$run_dir/wayland-0" --setenv WAYLAND_DISPLAY wayland-0)
+elif [[ $x11_mode == none && -n ${DISPLAY:-} ]]; then
+    warn "no Wayland in this session: using the session's X11 (less isolated)"
+    x11_mode=host
+fi
+x11_private=0
+if [[ $x11_mode == host && -n ${DISPLAY:-} ]]; then
+    n=${DISPLAY#*:}; n=${n%%.*}
+    args+=(--ro-bind-try "/tmp/.X11-unix/X$n" "/tmp/.X11-unix/X$n" --setenv DISPLAY "$DISPLAY")
+    [[ -n ${XAUTHORITY:-} && -f $XAUTHORITY ]] && args+=(--ro-bind "$XAUTHORITY" "$XAUTHORITY" --setenv XAUTHORITY "$XAUTHORITY")
+elif [[ $x11_mode == private && $test_mode == 0 ]]; then
+    x11lib=$(find_file x11-private.sh) || die "x11-private.sh not found"
+    # shellcheck source=../lib/x11-private.sh
+    source "$x11lib"
+    x11p_start || exit 1
+    x11_private=1
+    mapfile -t x11_args < <(x11p_bwrap_args)
+    args+=("${x11_args[@]}")
+fi
+[[ -n ${XDG_SESSION_TYPE:-} ]] && args+=(--setenv XDG_SESSION_TYPE "$XDG_SESSION_TYPE")
+
+# audio (note: whoever has PipeWire can also record the microphone; with no network there is nowhere to send it)
+if [[ $audio == 1 ]]; then
+    [[ -S "$run_dir/pipewire-0" ]] && args+=(--ro-bind "$run_dir/pipewire-0" "$run_dir/pipewire-0")
+    [[ -S "$run_dir/pulse/native" ]] &&
+        args+=(--ro-bind "$run_dir/pulse/native" "$run_dir/pulse/native" --setenv PULSE_SERVER "unix:$run_dir/pulse/native")
+fi
+[[ -n ${MANGOHUD:-} ]] && args+=(--setenv MANGOHUD "$MANGOHUD")
+while IFS='=' read -r var value; do
+    args+=(--setenv "${var#LOCKBOX_ENV_}" "$value")
+done < <(env | grep -E '^LOCKBOX_ENV_[A-Za-z0-9_]+=' || true)
+
+args+=("${binds[@]}")
+
+# system call filter (seccomp): generated on every run, passed on fd 9
+if [[ $seccomp == 1 ]]; then
+    if generator=$(find_file lockbox-seccomp); then
+        if [[ $userns == 1 ]]; then "$generator" --userns; else "$generator"; fi > "$state/seccomp.bpf"
+        exec 9< "$state/seccomp.bpf"
+        args+=(--seccomp 9)
+    else
+        warn "lockbox-seccomp not found (run make): no seccomp filter"
+    fi
+fi
+
+cleanup() { [[ $x11_private == 1 ]] && x11p_stop; rm -rf "$state"; }
+
+if [[ $test_mode == 1 ]]; then
+    probe=$(find_file lockbox-probe || true)
+    [[ -n $probe ]] && args+=(--ro-bind "$probe" /run/lockbox-probe)
+    trap cleanup EXIT
+    set +e
+    bwrap "${args[@]}" env LOCKBOX_X11="$x11_mode" LOCKBOX_USERNS="$userns" LOCKBOX_NET="$net" bash -c '
+        failed=0
+        ok() { echo "  ok    $*"; }; bad() { echo "  FAIL  $*"; failed=1; }; note() { echo "  note  $*"; }
+        echo "home as the app sees it:"; ls -A ~ | sed "s/^/    /"
+        if ls ~/Documents ~/Documentos ~/Downloads ~/.ssh ~/.mozilla 2>/dev/null | grep -q .; then bad "personal folders visible"; else ok "personal folders hidden"; fi
+        echo "disks under /mnt and /run/media (only what you allowed):"; find /mnt /run/media -mindepth 1 -maxdepth 3 2>/dev/null | head -10 | sed "s/^/    /"
+        echo "network:"
+        if timeout 5 bash -c "exec 3<>/dev/tcp/1.1.1.1/443" 2>/dev/null; then
+            [[ $LOCKBOX_NET == 1 ]] && note "network allowed (--net)" || bad "network reachable"
+        else ok "no network"; fi
+        echo "input:"
+        for d in /dev/input/event*; do
+            [[ -r $d ]] || continue
+            n=$(cat /sys/class/input/${d##*/}/device/name 2>/dev/null)
+            if grep -qx "ID_INPUT_KEYBOARD=1" /run/udev/data/c$(stat -c "%t:%T" "$d" | { IFS=: read a b; echo $((16#$a)):$((16#$b)); }) 2>/dev/null; then
+                bad "keyboard readable: $d ($n)"; else note "readable: $d ($n)"; fi
+        done
+        if ls /dev/hidraw* >/dev/null 2>&1; then for d in /dev/hidraw*; do
+            s=/sys/class/hidraw/${d##*/}/device; n=$(grep -m1 ^HID_NAME= $s/uevent | cut -d= -f2)
+            if compgen -G "$s/input/input*/js*" >/dev/null; then ok "controller hidraw: $d ($n)"; else bad "non-controller hidraw: $d ($n)"; fi
+        done; else ok "no hidraw"; fi
+        [[ -e /dev/uinput ]] && bad "uinput visible (could type outside the box)" || ok "no uinput"
+        echo "display:"
+        x=$(ls /tmp/.X11-unix 2>/dev/null | tr "\n" " ")
+        case $LOCKBOX_X11 in
+            none) [[ -n $x ]] && bad "session X11 visible: $x" || ok "no session X11" ;;
+            private) ok "private X11 (started only when the app runs)" ;;
+            host) note "session X11: the app can read keystrokes of other X11 windows" ;;
+        esac
+        if [[ -x /run/lockbox-probe ]]; then
+            r=$(/run/lockbox-probe); c=$?
+            case $c in 0) ok "$r" ;; 1) while read -r l; do bad "${l#EXPOSED: }"; done <<< "$r" ;; *) note "$r" ;; esac
+        fi
+        echo "kernel:"
+        grep -q "^Seccomp:[[:space:]]*2" /proc/self/status && ok "seccomp filter active" || bad "no seccomp filter"
+        if unshare -U true 2>/dev/null; then
+            [[ $LOCKBOX_USERNS == 1 ]] && note "user namespaces allowed (--allow-userns)" || bad "can create user namespaces"
+        else ok "user namespaces blocked"; fi
+        ok "machine-id of this box ($(head -c 8 /etc/machine-id)…)"
+        echo "audio:"
+        ls /run/user/*/pipewire-0 /run/user/*/pulse/native >/dev/null 2>&1 && note "PipeWire/Pulse: sound and MICROPHONE (use --no-audio if not needed)" || ok "no audio"
+        echo; [[ $failed == 0 ]] && echo "result: OK" || echo "result: FAILED (see the FAIL lines)"
+        exit $failed'
+    exit $?
+fi
+
+[[ $# -gt 0 ]] || die "missing the command (lockbox --home DIR [options] -- command)"
+pre=()
+[[ -n $memory ]] && pre=(systemd-run --user --scope --quiet -p "MemoryMax=$memory" -p MemorySwapMax=0 --)
+if [[ $x11_private == 1 ]]; then
+    trap cleanup EXIT INT TERM HUP
+    set +e
+    "${pre[@]}" bwrap "${args[@]}" "$@"
+    exit $?
+fi
+# bwrap inherits the Wayland helper's fd: when the app (and everything it started) exits, the helper removes the
+# socket; the state folder is removed by the next lockbox run (see above)
+exec "${pre[@]}" bwrap "${args[@]}" "$@"

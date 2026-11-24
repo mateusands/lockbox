@@ -1,0 +1,13 @@
+<protocol name="security_context_v1">
+ <interface name="wp_security_context_manager_v1" version="1">
+  <request name="destroy" type="destructor"/>
+  <request name="create_listener"><arg name="id" type="new_id" interface="wp_security_context_v1"/><arg name="listen_fd" type="fd"/><arg name="close_fd" type="fd"/></request>
+ </interface>
+ <interface name="wp_security_context_v1" version="1">
+  <request name="destroy" type="destructor"/>
+  <request name="set_sandbox_engine"><arg name="name" type="string"/></request>
+  <request name="set_app_id"><arg name="app_id" type="string"/></request>
+  <request name="set_instance_id"><arg name="instance_id" type="string"/></request>
+  <request name="commit"/>
+ </interface>
+</protocol>

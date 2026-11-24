@@ -1,0 +1,15 @@
+# A KDE/GNOME menu entry for an app in a box.
+# Copy it to ~/.local/share/applications/my-app.desktop and change the paths (.desktop files do not expand ~ or
+# $HOME: use the full path). Right-click it in the menu → "Test box isolation" opens a terminal with --test.
+[Desktop Entry]
+Type=Application
+Name=My App (lockbox)
+Comment=Runs isolated: no network and no access to your files
+Exec=/home/YOU/Boxes/my-app/run.sh %f
+Icon=application-x-executable
+Categories=Game;
+Actions=test;
+
+[Desktop Action test]
+Name=Test box isolation
+Exec=konsole --hold -e /home/YOU/Boxes/my-app/run.sh --test

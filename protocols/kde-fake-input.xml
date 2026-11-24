@@ -1,0 +1,5 @@
+<protocol name="fake_input">
+ <interface name="org_kde_kwin_fake_input" version="4">
+  <request name="authenticate"><arg name="application" type="string"/><arg name="reason" type="string"/></request>
+ </interface>
+</protocol>
